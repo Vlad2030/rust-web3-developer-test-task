@@ -1,0 +1,7 @@
+# public keys
+wallets:
+    - 3Mug4XRX29yZVsNfYyex6y2QQeVqUMv5HkVQixJ4cMUq
+    - 6euLebr15vS9AkGihNuRKwG9SA4MA7SdrKkQT1DveJuY
+
+# available: mainnet, testnet, devnet
+cluster: mainnet
