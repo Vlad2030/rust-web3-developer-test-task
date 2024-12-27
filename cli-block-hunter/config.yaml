@@ -1,0 +1,15 @@
+yellowstone:
+    endpoint: http://127.0.0.1/:10000
+    x_token: ...
+
+# private key
+wallet: private_key
+
+# public key
+recipient: public_key
+
+# amount in lamports
+amount: 100000000
+
+# available: mainnet, testnet, devnet
+cluster: devnet

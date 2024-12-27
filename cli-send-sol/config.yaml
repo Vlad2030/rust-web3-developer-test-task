@@ -1,0 +1,17 @@
+# private keys
+wallets:
+    - private_key
+    - private_key
+    - private_key
+
+# public keys
+recipients:
+    - public_key
+    - public_key
+    - public_key
+
+# amount in lamports
+amount: 1000000000
+
+# available: mainnet, testnet, devnet
+cluster: devnet

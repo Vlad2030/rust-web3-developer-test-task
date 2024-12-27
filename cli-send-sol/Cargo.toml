@@ -1,0 +1,24 @@
+[package]
+name = "cli-send-sol"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = {version = "1.42.0", features = ["full"]}
+serde = {version = "1.0.216", features = ["derive"]}
+serde_json = "1.0.134"
+serde_yaml = "0.9.33"
+chrono = {version = "0.4.39", features = ["serde"]}
+solana-sdk = "2.1.7"
+solana-client = "2.1.7"
+solana-program = "2.1.7"
+
+[profile.dev]
+opt-level = 0
+lto = "off"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+panic = "abort"
+codegen-units = 1
