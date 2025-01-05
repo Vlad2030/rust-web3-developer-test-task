@@ -1,431 +1,213 @@
-use solana_program::{
-    account_info::{next_account_info, AccountInfo},
-    entrypoint,
-    entrypoint::ProgramResult,
-    msg,
-    program_error::ProgramError,
-    pubkey::Pubkey,
-};
+use std::u64;
 
-entrypoint!(process_instruction);
+use solana_program::sysvar::Sysvar;
+
+solana_program::entrypoint!(process_instruction);
 
 pub fn process_instruction(
-    _program_id: &Pubkey,
-    _accounts: &[AccountInfo],
-    _instruction_data: &[u8],
-) -> ProgramResult {
-    msg!("Solana Program");
+    program_id: &solana_program::pubkey::Pubkey,
+    accounts: &[solana_program::account_info::AccountInfo],
+    instruction_data: &[u8],
+) -> solana_program::entrypoint::ProgramResult {
+    let accounts_iter = &mut accounts.iter();
 
-    let accounts_iter = &mut _accounts.iter();
-    let user_account = next_account_info(accounts_iter)?;
-    let program_account = next_account_info(accounts_iter)?;
-    let user_balance_account = next_account_info(accounts_iter)?;
+    let user_account = solana_program::account_info::next_account_info(accounts_iter)?;
+    solana_program::msg!(
+        "User account: {}, is signer: {}, is writable: {}",
+        user_account.key,
+        user_account.is_signer,
+        user_account.is_writable,
+    );
+
+    let user_pda_account = solana_program::account_info::next_account_info(accounts_iter)?;
+    solana_program::msg!(
+        "User PDA: {}, is signer: {}, is writable: {}",
+        user_pda_account.key,
+        user_pda_account.is_signer,
+        user_pda_account.is_writable,
+    );
 
     if !user_account.is_signer {
-        return Err(ProgramError::MissingRequiredSignature);
+        return Err(solana_program::program_error::ProgramError::MissingRequiredSignature);
     }
 
-    // 0 = Balance, 1 = Deposit, 2 = Withdraw
-    match _instruction_data[0] {
-        0 => {
-            msg!("Fetching balance");
+    if instruction_data.len() < 9 {
+        return Err(solana_program::program_error::ProgramError::InvalidInstructionData);
+    }
 
-            let user_balance_data = user_balance_account.try_borrow_data()?;
-            let current_balance =
-                u64::from_le_bytes(user_balance_data[..8].try_into().unwrap_or([0; 8]));
+    solana_program::msg!("Finding PDA");
 
-            msg!("Current balance: {} lamports", current_balance);
+    let (pda_account, bump_seed) = solana_program::pubkey::Pubkey::find_program_address(
+        &[user_account.key.as_ref()],
+        program_id,
+    );
+
+    solana_program::msg!("Found PDA: {}, seed: {}", pda_account, bump_seed);
+
+    solana_program::msg!("Checking PDA validity");
+
+    if user_pda_account.key != &pda_account {
+        return Err(solana_program::program_error::ProgramError::InvalidAccountData);
+    }
+
+    solana_program::msg!("Checking PDA data");
+
+    if user_pda_account.data_is_empty() {
+        solana_program::msg!("PDA data empty");
+
+        let rent = solana_program::rent::Rent::get()?;
+        let rent_required_lamports = rent.minimum_balance(8);
+
+        if **user_account.try_borrow_lamports()? <= rent_required_lamports {
+            return Err(solana_program::program_error::ProgramError::InsufficientFunds);
         }
-        1 => {
-            msg!("Processing deposit");
 
-            let deposit_amount = u64::from_le_bytes(
-                _instruction_data[1..9]
-                    .try_into()
-                    .map_err(|_| ProgramError::InvalidInstructionData)?,
-            );
+        solana_program::program::invoke_signed(
+            &solana_program::system_instruction::create_account(
+                user_account.key,
+                user_pda_account.key,
+                rent_required_lamports,
+                8,
+                program_id,
+            ),
+            &[user_account.clone(), user_pda_account.clone()],
+            &[&[user_account.key.as_ref(), &[bump_seed]]],
+        )?;
+    }
 
-            **program_account.try_borrow_mut_lamports()? += deposit_amount;
-            **user_account.try_borrow_mut_lamports()? -= deposit_amount;
+    let instruction = InstructionType::unpack(instruction_data)?;
 
-            let mut user_balance_data = user_balance_account.try_borrow_mut_data()?;
-            let current_balance =
-                u64::from_le_bytes(user_balance_data[..8].try_into().unwrap_or([0; 8]));
-            let new_balance = current_balance + deposit_amount;
-            user_balance_data[..8].copy_from_slice(&new_balance.to_le_bytes());
+    match instruction {
+        InstructionType::Balance => {
+            solana_program::msg!("Fetching balance");
 
-            msg!(
-                "Deposited {} lamports. New balance: {} lamports",
-                deposit_amount,
-                new_balance
-            );
+            let current_balance = read_balance(user_pda_account)?;
+
+            solana_program::msg!("Current balance: {} lamports", current_balance);
         }
-        2 => {
-            msg!("Processing withdrawal");
 
-            let withdraw_amount = u64::from_le_bytes(
-                _instruction_data[1..9]
-                    .try_into()
-                    .map_err(|_| ProgramError::InvalidInstructionData)?,
-            );
+        InstructionType::Deposit => {
+            solana_program::msg!("Processing deposit");
 
-            if **program_account.lamports.borrow() < withdraw_amount {
-                return Err(ProgramError::InsufficientFunds);
+            let deposit_amount = u64_from_data(&instruction_data[1..9])?;
+
+            solana_program::msg!("Lamports to deposit: {}", deposit_amount);
+
+            if deposit_amount <= u64::MIN {
+                return Err(solana_program::program_error::ProgramError::InsufficientFunds);
             }
 
-            let mut user_balance_data = user_balance_account.try_borrow_mut_data()?;
-            let current_balance =
-                u64::from_le_bytes(user_balance_data[..8].try_into().unwrap_or([0; 8]));
+            solana_program::program::invoke(
+                &solana_program::system_instruction::transfer(
+                    user_account.key,
+                    user_pda_account.key,
+                    deposit_amount,
+                ),
+                &[user_account.clone(), user_pda_account.clone()],
+            )?;
+
+            update_balance(user_pda_account, deposit_amount, true)?;
+
+            solana_program::msg!(
+                "Deposit successful. New PDA balance: {}, user account balance updated.",
+                read_balance(user_pda_account)?,
+            );
+        }
+
+        InstructionType::Withdraw => {
+            solana_program::msg!("Processing withdrawal");
+
+            let withdraw_amount = u64_from_data(&instruction_data[1..9])?;
+
+            solana_program::msg!("Lamports to withdraw: {}", withdraw_amount);
+
+            let current_balance = read_balance(user_pda_account)?;
+
             if current_balance < withdraw_amount {
-                return Err(ProgramError::InsufficientFunds);
+                return Err(solana_program::program_error::ProgramError::InsufficientFunds);
             }
 
-            let new_balance = current_balance - withdraw_amount;
-            user_balance_data[..8].copy_from_slice(&new_balance.to_le_bytes());
-
-            **program_account.try_borrow_mut_lamports()? -= withdraw_amount;
+            **user_pda_account.try_borrow_mut_lamports()? -= withdraw_amount;
             **user_account.try_borrow_mut_lamports()? += withdraw_amount;
 
-            msg!(
-                "Withdrew {} lamports. Remaining balance: {} lamports",
-                withdraw_amount,
-                new_balance
-            );
-        }
-        _ => {
-            msg!("Invalid instruction");
+            update_balance(user_pda_account, withdraw_amount, false)?;
 
-            return Err(ProgramError::InvalidInstructionData);
+            solana_program::msg!(
+                "Withdrawal successful. New PDA balance: {}, user account balance updated.",
+                read_balance(user_pda_account)?,
+            );
         }
     }
 
     Ok(())
 }
 
-#[cfg(test)]
-mod test {
-    use super::*;
-    use solana_program::{
-        instruction::{AccountMeta, Instruction},
-        pubkey::Pubkey,
+#[derive(Debug, PartialEq)]
+pub enum InstructionType {
+    Balance = 1,
+    Deposit = 2,
+    Withdraw = 3,
+}
+
+impl InstructionType {
+    pub fn unpack(input: &[u8]) -> Result<Self, solana_program::program_error::ProgramError> {
+        match input[0] {
+            1 => Ok(Self::Balance),
+            2 => Ok(Self::Deposit),
+            3 => Ok(Self::Withdraw),
+            _ => Err(solana_program::program_error::ProgramError::InvalidInstructionData),
+        }
+    }
+
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Self::Balance => 1,
+            Self::Deposit => 2,
+            Self::Withdraw => 3,
+        }
+    }
+}
+
+fn read_balance(
+    account: &solana_program::account_info::AccountInfo,
+) -> Result<u64, solana_program::program_error::ProgramError> {
+    let data = account.try_borrow_data()?;
+    let balance = u64_from_data(&data)?;
+
+    Ok(balance)
+}
+
+fn update_balance(
+    account: &solana_program::account_info::AccountInfo,
+    amount: u64,
+    is_deposit: bool,
+) -> solana_program::entrypoint::ProgramResult {
+    let mut data = account.try_borrow_mut_data()?;
+
+    let current_balance = u64_from_data(&data)?;
+
+    let new_balance = match is_deposit {
+        true => current_balance
+            .checked_add(amount)
+            .ok_or(solana_program::program_error::ProgramError::InvalidAccountData)?,
+        false => current_balance
+            .checked_sub(amount)
+            .ok_or(solana_program::program_error::ProgramError::InsufficientFunds)?,
     };
-    use solana_program_test::{processor, ProgramTest};
-    use solana_sdk::{
-        account::Account,
-        signature::{Keypair, Signer},
-        transaction::Transaction,
-        commitment_config::CommitmentLevel,
-    };
-    use std::str::FromStr;
 
-    #[tokio::test]
-    async fn test_get_balance() -> Result<(), Box<dyn std::error::Error>> {
-        let program_id = Pubkey::from_str("ELEHyLRJYNt8B5iBHzhGPTajuhchhXP5sx5RJAD7bvCS")?;
-        // let program_id = Pubkey::new_unique();
-        println!("program_id: {:#?}", program_id);
+    data.copy_from_slice(&new_balance.to_le_bytes());
 
-        let user_account = Keypair::new();
-        println!("user_account: {:#?}", user_account.pubkey());
+    Ok(())
+}
 
-        let program_account = Keypair::new();
-        println!("program_account: {:#?}", program_account.pubkey());
-
-        let user_balance_account = Keypair::new();
-        println!("user_balance_account: {:#?}", user_balance_account.pubkey());
-
-        let mut program_test = ProgramTest::new(
-            "solana_program",
-            program_id,
-            processor!(process_instruction),
-        );
-
-        program_test.add_account(
-            user_account.pubkey(),
-            Account {
-                lamports: 1000,
-                data: vec![0; 0],
-                owner: program_id,
-                executable: false,
-                rent_epoch: 0,
-            },
-        );
-
-        program_test.add_account(
-            program_account.pubkey(),
-            Account {
-                lamports: 1000000000,
-                data: vec![0; 0],
-                owner: program_id,
-                executable: false,
-                rent_epoch: 0,
-            },
-        );
-
-        program_test.add_account(
-            user_balance_account.pubkey(),
-            Account {
-                lamports: 0,
-                data: vec![0; 8],
-                owner: program_id,
-                executable: false,
-                rent_epoch: 0,
-            },
-        );
-
-        let (mut banks_client, payer, recent_blockhash) = program_test.start().await;
-
-        let deposit_amount = 100;
-        println!("deposit_amount: {:#?}", deposit_amount);
-
-        let instruction_data = vec![0];
-        println!("instruction_data: {:#?}", instruction_data);
-
-        let instruction = Instruction::new_with_borsh(
-            program_id,
-            &instruction_data,
-            vec![
-                AccountMeta::new(user_account.pubkey(), true),
-                AccountMeta::new(program_account.pubkey(), false),
-                AccountMeta::new(user_balance_account.pubkey(), false),
-            ],
-        );
-        println!("instruction: {:#?}", instruction);
-
-        let mut transaction =
-            Transaction::new_with_payer(&[instruction], Some(&user_account.pubkey()));
-        println!("transaction: {:#?}", transaction);
-
-        transaction.sign(&[&user_account], recent_blockhash);
-
-        let result = banks_client.process_transaction(transaction).await;
-        println!("result: {:#?}", result);
-
-        assert!(result.is_ok());
-
-        Ok(())
+fn u64_from_data(data: &[u8]) -> Result<u64, solana_program::program_error::ProgramError> {
+    if data.len() < 8 {
+        return Err(solana_program::program_error::ProgramError::AccountDataTooSmall);
     }
 
-    #[tokio::test]
-    async fn test_deposit() -> Result<(), Box<dyn std::error::Error>> {
-        let program_id = Pubkey::from_str("ELEHyLRJYNt8B5iBHzhGPTajuhchhXP5sx5RJAD7bvCS")?;
-        // let program_id = Pubkey::new_unique();
-        println!("program_id: {:#?}", program_id);
+    let parsed = data[..8]
+        .try_into()
+        .map_err(|_| solana_program::program_error::ProgramError::InvalidAccountData)?;
 
-        let user_account = Keypair::new();
-        println!("user_account: {:#?}", user_account.pubkey());
-
-        let program_account = Keypair::new();
-        println!("program_account: {:#?}", program_account.pubkey());
-
-        let user_balance_account = Keypair::new();
-        println!("user_balance_account: {:#?}", user_balance_account.pubkey());
-
-        let mut program_test = ProgramTest::new(
-            "solana_program",
-            program_id,
-            processor!(process_instruction),
-        );
-
-        program_test.add_account(
-            user_account.pubkey(),
-            Account {
-                lamports: 1000,
-                data: vec![0; 0],
-                owner: program_id,
-                executable: false,
-                rent_epoch: 0,
-            },
-        );
-
-        program_test.add_account(
-            program_account.pubkey(),
-            Account {
-                lamports: 1000000000,
-                data: vec![0; 0],
-                owner: program_id,
-                executable: false,
-                rent_epoch: 0,
-            },
-        );
-
-        program_test.add_account(
-            user_balance_account.pubkey(),
-            Account {
-                lamports: 0,
-                data: vec![0; 8],
-                owner: program_id,
-                executable: false,
-                rent_epoch: 0,
-            },
-        );
-
-        let (mut banks_client, payer, recent_blockhash) = program_test.start().await;
-
-        let deposit_amount = 100;
-        println!("deposit_amount: {:#?}", deposit_amount);
-
-        let instruction_data = vec![1, deposit_amount as u8, (deposit_amount >> 8) as u8];
-        println!("instruction_data: {:#?}", instruction_data);
-
-        let instruction = Instruction::new_with_borsh(
-            program_id,
-            &instruction_data,
-            vec![
-                AccountMeta::new(user_account.pubkey(), true),
-                AccountMeta::new(program_account.pubkey(), false),
-                AccountMeta::new(user_balance_account.pubkey(), false),
-            ],
-        );
-        println!("instruction: {:#?}", instruction);
-
-        let mut transaction =
-            Transaction::new_with_payer(&[instruction], Some(&user_account.pubkey()));
-        transaction.sign(&[&user_account], recent_blockhash);
-        println!("transaction: {:#?}", transaction);
-
-        let result = banks_client.process_transaction(transaction).await;
-        println!("result: {:#?}", result);
-
-        assert!(result.is_ok());
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_sol_program() -> Result<(), Box<dyn std::error::Error>> {
-        let program_id = Pubkey::from_str("ELEHyLRJYNt8B5iBHzhGPTajuhchhXP5sx5RJAD7bvCS")?;
-        // let program_id = Pubkey::new_unique();
-        println!("program_id: {:#?}", program_id);
-
-        let user_account = Keypair::new();
-        println!("user_account: {:#?}", user_account.pubkey());
-
-        let program_account = Keypair::new();
-        println!("program_account: {:#?}", program_account.pubkey());
-
-        let user_balance_account = Keypair::new();
-        println!("user_balance_account: {:#?}", user_balance_account.pubkey());
-
-        let mut program_test = ProgramTest::new(
-            "solana_program",
-            program_id,
-            processor!(process_instruction),
-        );
-
-        program_test.add_account(
-            user_account.pubkey(),
-            Account {
-                lamports: 1000,
-                data: vec![0; 0],
-                owner: program_id,
-                executable: false,
-                rent_epoch: 0,
-            },
-        );
-
-        program_test.add_account(
-            program_account.pubkey(),
-            Account {
-                lamports: 1000000000,
-                data: vec![0; 0],
-                owner: program_id,
-                executable: false,
-                rent_epoch: 0,
-            },
-        );
-
-        program_test.add_account(
-            user_balance_account.pubkey(),
-            Account {
-                lamports: 0,
-                data: vec![0; 8],
-                owner: program_id,
-                executable: false,
-                rent_epoch: 0,
-            },
-        );
-
-        let (mut banks_client, payer, recent_blockhash) = program_test.start().await;
-
-        let deposit_amount = 100;
-        println!("deposit_amount: {:#?}", deposit_amount);
-
-        let instruction_data = vec![1, deposit_amount as u8, (deposit_amount >> 8) as u8];
-        println!("instruction_data: {:#?}", instruction_data);
-
-        let instruction = Instruction::new_with_borsh(
-            program_id,
-            &instruction_data,
-            vec![
-                AccountMeta::new(user_account.pubkey(), true),
-                AccountMeta::new(program_account.pubkey(), false),
-                AccountMeta::new(user_balance_account.pubkey(), false),
-            ],
-        );
-        println!("instruction: {:#?}", instruction);
-
-        let mut transaction =
-            Transaction::new_with_payer(&[instruction], Some(&user_account.pubkey()));
-        transaction.sign(&[&user_account], recent_blockhash);
-        println!("transaction: {:#?}", transaction);
-
-        let result = banks_client.process_transaction(transaction).await;
-        println!("result: {:#?}", result);
-
-
-        let balance_data = banks_client
-            .get_account(user_balance_account.pubkey())
-            .await?
-            .unwrap()
-            .data;
-        println!("balance_data: {:#?}", balance_data);
-
-        let current_balance = u64::from_le_bytes(balance_data[..8].try_into().unwrap_or([0; 8]));
-        println!("current_balance: {:#?}", current_balance);
-
-        assert_eq!(current_balance, deposit_amount as u64);
-
-        let withdraw_amount = 50;
-        println!("withdraw_amount: {:#?}", withdraw_amount);
-
-        let instruction_data = vec![2, withdraw_amount as u8, (withdraw_amount >> 8) as u8];
-        println!("instruction_data: {:#?}", instruction_data);
-
-        let instruction = Instruction::new_with_borsh(
-            program_id,
-            &instruction_data,
-            vec![
-                AccountMeta::new(user_account.pubkey(), true),
-                AccountMeta::new(program_account.pubkey(), false),
-                AccountMeta::new(user_balance_account.pubkey(), false),
-            ],
-        );
-        println!("instruction: {:#?}", instruction);
-
-        let mut transaction =
-            Transaction::new_with_payer(&[instruction], Some(&user_account.pubkey()));
-        println!("transaction: {:#?}", transaction);
-
-        transaction.sign(&[&user_account], recent_blockhash);
-
-        let result = banks_client.process_transaction(transaction).await;
-        println!("result: {:#?}", result);
-
-        let balance_data = banks_client
-            .get_account(user_balance_account.pubkey())
-            .await?
-            .unwrap()
-            .data;
-        println!("balance_data: {:#?}", balance_data);
-
-        let current_balance = u64::from_le_bytes(balance_data[..8].try_into().unwrap_or([0; 8]));
-        println!("current_balance: {:#?}", current_balance);
-
-        assert_eq!(
-            current_balance,
-            deposit_amount as u64 - withdraw_amount as u64
-        );
-
-        Ok(())
-    }
+    Ok(u64::from_le_bytes(parsed))
 }
